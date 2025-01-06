@@ -2,11 +2,12 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+from keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
 from sklearn.model_selection import GridSearchCV
 from tensorflow.keras import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import LSTM, Dense, Dropout, LayerNormalization
 from tensorflow.keras.wrappers.scikit_learn import KerasRegressor
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from scipy.stats import zscore
@@ -15,8 +16,9 @@ from datetime import datetime, timedelta
 from tensorflow.keras.models import load_model
 import os
 
-# Modelin kaydedileceği dosya adı
-model_filename = 'best_model.h5'
+# Zaman adımına uygun model dosya adını oluştur
+def get_model_filename(time_step):
+    return f'model_time_step_{time_step}.h5'
 
 # Streamlit başlık ve ayarlar
 st.title("Hisse Senedi Fiyat Tahmini")
@@ -32,28 +34,42 @@ num_days = st.slider("Gelecek gün sayısını seçin", min_value=1, max_value=6
 
 
 # Zaman adımını belirleme
-def determine_time_step(data, min_time_step=2, max_time_step=60):
+def determine_time_step(data, min_time_step=2, average_time_step=5, max_time_step=20):
     """
-    Zaman adımını belirlemek için veriyi bölebilecek uygun bir zaman adımı seçer.
+    Zaman adımını veri boyutuna göre dinamik olarak belirler.
 
-    :param data: Verinin tamamı
+    :param data: Verinin tamamı (liste, dizi, vb.)
     :param min_time_step: Zaman adımının alabileceği minimum değer
-    :param max_time_step: Zaman adımının alabileceği maksimum değer (isteğe bağlı)
+    :param average_time_step: Orta düzey veri boyutları için varsayılan zaman adımı
+    :param max_time_step: Zaman adımının alabileceği maksimum değer
     :return: Seçilen zaman adımı
     """
+    # Veri uzunluğunu al
     data_length = len(data)
 
-    # Verinin boyutuna göre uygun bir zaman adımı hesapla
-    time_step = data_length // 40  # Veriyi 40'a bölen bir zaman adımı (yaklaşık 5% örnekleme)
+    # Hata kontrolü
+    if min_time_step <= 0 or max_time_step <= 0:
+        raise ValueError("Zaman adımları sıfırdan büyük olmalıdır!")
+    if min_time_step > max_time_step:
+        raise ValueError("Minimum zaman adımı maksimumdan büyük olamaz!")
 
-    if time_step < min_time_step:
+    # Zaman adımını belirle
+    if data_length < 500:
         time_step = min_time_step
-        st.warning(f"Veri boyutu ({data_length}) çok küçük. Zaman adımı {min_time_step} olarak ayarlandı.")
-    elif max_time_step and time_step > max_time_step:
-        time_step = max_time_step
-        st.warning(f"Veri boyutu ({data_length}) çok büyük. Zaman adımı {max_time_step} olarak ayarlandı.")
+        message = f"Veri boyutu ({data_length}) küçük. Zaman adımı {min_time_step} olarak ayarlandı."
+    elif 500 <= data_length < 1000:
+        time_step = average_time_step
+        message = f"Veri boyutu ({data_length}) orta düzey. Zaman adımı {average_time_step} olarak ayarlandı."
     else:
-        st.warning(f"Veri boyutu ({data_length}) için zaman adımı {time_step} olarak belirlendi.")
+        time_step = max_time_step
+        message = f"Veri boyutu ({data_length}) büyük. Zaman adımı {max_time_step} olarak belirlendi."
+
+    # Uyarıyı döndür
+    try:
+        import streamlit as st
+        st.warning(message)
+    except ImportError:
+        print(message)
 
     return time_step
 
@@ -71,24 +87,29 @@ def remove_outliers(data, threshold=3):
     return data[filtered_entries]
 
 # LSTM modelini oluşturma fonksiyonu
-def create_model(units=256, dropout_rate=0.2):
+from tensorflow.keras.regularizers import l2
+
+def create_model(units=256, dropout_rate=0.2, l2_rate=0.001):
     model = Sequential()
 
-    # LSTM katmanını ekleyin
-    model.add(LSTM(units=units, return_sequences=True, input_shape=(X_train.shape[1], 1)))
-    model.add(Dropout(dropout_rate))
-    model.add(LSTM(units=units, return_sequences=True))  # Ekstra LSTM katmanı
-    model.add(Dropout(dropout_rate))
-    model.add(LSTM(units=units, return_sequences=False))  # Final LSTM katmanı
+    # İlk LSTM Katmanı
+    model.add(LSTM(units=units, return_sequences=True, kernel_regularizer=l2(l2_rate)))
+    model.add(LayerNormalization())
     model.add(Dropout(dropout_rate))
 
-    # Çıkış katmanını ekleyin
-    model.add(Dense(1))
+    # İkinci LSTM Katmanı
+    model.add(LSTM(units=units, return_sequences=False, kernel_regularizer=l2(l2_rate)))
+    model.add(LayerNormalization())
+    model.add(Dropout(dropout_rate))
 
-    # Modeli derleyin
-    model.compile(optimizer='adam', loss='mean_squared_error')
+    # Çıkış Katmanı
+    model.add(Dense(1, kernel_regularizer=l2(l2_rate)))
 
+    # Modeli Derleme
+    optimizer = Adam(learning_rate=0.0001)
+    model.compile(optimizer=optimizer, loss='mean_squared_error')
     return model
+
 
 # Veriyi çekme düğmesi
 if st.button("Veriyi Çek ve Modeli Eğit"):
@@ -156,27 +177,15 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
         X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
         X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
 
-        # Modelin kaydedilip kaydedilmediğini kontrol et
+        # Model dosya adını belirle
+        model_filename = get_model_filename(time_step)
+
+        # Modelin var olup olmadığını kontrol et
         if os.path.exists(model_filename):
             # Mevcut model yükleniyor
             best_model = load_model(model_filename)
-            st.write("Mevcut model yüklendi!")
+            st.write(f"Zaman adımına uygun mevcut model ({model_filename}) yüklendi.")
 
-            # Modelin beklentisini kontrol et
-            expected_input_shape = best_model.input_shape
-            expected_time_step = expected_input_shape[1]  # Modelin beklediği zaman adımı
-            st.write(f"Modelin beklediği zaman adımı: {expected_time_step}")
-
-            # Eğer zaman adımları uyumsuzsa, X_test'i uygun şekilde yeniden şekillendir
-            if time_step != expected_time_step:
-                st.write(
-                    f"Uyarı: Eğitimde kullanılan zaman adımı ({expected_time_step}) ile test verisindeki zaman adımı ({time_step}) uyuşmuyor!")
-                # Test verisini modelin beklediği zaman adımına göre yeniden şekillendir
-                X_test = X_test[:, :expected_time_step, :]  # Zaman adımı uyumsuzluğunu çözmek için veriyi kesiyoruz
-                st.write(f"Test verisi zaman adımı uyumlu hale getirildi: {expected_time_step}")
-
-            # Gerçek ve tahmin edilen fiyatları görselleştirme
-            st.subheader("Gerçek ve Tahmin Edilen Fiyatlar")
             # `X_test` ve `Y_test` daha önce eğitimde kullanıldı ve mevcut
             predictions = best_model.predict(X_test)
             predictions = scaler.inverse_transform(predictions.reshape(-1, 1))
@@ -184,8 +193,8 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
                 Y_test.reshape(-1, 1))  # Y_test_original her durumda tanımlanmalı
         else:
 
-            # Eğer model yoksa, model eğitimi başlatılıyor
-            st.write("Model eğitiliyor...")
+            # Model yok, eğitimi başlat
+            st.write(f"Zaman adımı ({time_step}) için uygun model bulunamadı. Yeni model eğitiliyor...")
 
             # Zaman adımını belirleme
             time_step = determine_time_step(stock_data)
@@ -202,9 +211,10 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
 
             # Hiperparametre grid tanımı
             param_grid = {
-                'units': [450, 475, 500],
+                #'units': [100, 200],
                 'batch_size': [32],
-                'epochs': [40, 45, 50],
+                'epochs': [50],
+                #'dropout_rate' : [0.2, 0.3],
             }
 
             # GridSearchCV uygulaması
@@ -220,7 +230,8 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
 
             # EarlyStopping ve ModelCheckpoint kullanımı
             early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-            checkpoint = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True, mode='min')
+            model_filename = get_model_filename(time_step)
+            checkpoint = ModelCheckpoint(model_filename, monitor='val_loss', save_best_only=True, mode='min')
 
             predictions = best_model.predict(X_test)
             predictions = scaler.inverse_transform(predictions.reshape(-1, 1))
