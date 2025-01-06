@@ -2,14 +2,10 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
 from sklearn.model_selection import GridSearchCV
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, LayerNormalization
-from tensorflow.keras.wrappers.scikit_learn import KerasRegressor
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+import xgboost as xgb
 from scipy.stats import zscore
 import streamlit as st
 from datetime import datetime, timedelta
@@ -18,11 +14,11 @@ import os
 
 # Zaman adımına uygun model dosya adını oluştur
 def get_model_filename(time_step):
-    return f'model_time_step_{time_step}.h5'
+    return f'xgboost_model_time_step_{time_step}.h5'
 
 # Streamlit başlık ve ayarlar
 st.title("Hisse Senedi Fiyat Tahmini")
-st.write("Bu uygulama, GridSearchCV kullanarak optimize edilen LSTM modeli ile hisse senedi fiyat tahmini yapar.")
+st.write("Bu uygulama, Xgboost modeli ile hisse senedi fiyat tahmini yapar.")
 
 # Kullanıcıdan hisse senedi sembolü ve tarih aralığı alalım
 ticker = st.text_input("Hisse Sembolü (Örn: AAPL)", "AAPL")
@@ -86,29 +82,6 @@ def remove_outliers(data, threshold=3):
     filtered_entries = (abs_z_scores < threshold).all(axis=1)  # Tüm sütunlarda eşik değerini kontrol eder
     return data[filtered_entries]
 
-# LSTM modelini oluşturma fonksiyonu
-from tensorflow.keras.regularizers import l2
-
-def create_model(units=256, dropout_rate=0.2, l2_rate=0.0001):
-    model = Sequential()
-
-    # İlk LSTM Katmanı
-    model.add(LSTM(units=units, return_sequences=True, kernel_regularizer=l2(l2_rate)))
-    model.add(LayerNormalization())
-    model.add(Dropout(dropout_rate))
-
-    # İkinci LSTM Katmanı
-    model.add(LSTM(units=units, return_sequences=False, kernel_regularizer=l2(l2_rate)))
-    model.add(LayerNormalization())
-    model.add(Dropout(dropout_rate))
-
-    # Çıkış Katmanı
-    model.add(Dense(1, kernel_regularizer=l2(l2_rate)))
-
-    # Modeli Derleme
-    optimizer = Adam(learning_rate=0.0001)
-    model.compile(optimizer=optimizer, loss='mean_squared_error')
-    return model
 
 
 # Veriyi çekme düğmesi
@@ -161,9 +134,6 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
             for i in range(len(data) - time_step - 1):
                 X.append(data[i:(i + time_step), 0])
                 Y.append(data[i + time_step, 0])
-            # Eğer veriyi oluştururken eksiklik varsa uyarı veriyoruz
-            if len(X) == 0:
-                st.warning("Insufficient data for the specified time_step. Try using a smaller time_step or more data.")
             return np.array(X), np.array(Y)
 
 
@@ -174,26 +144,29 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
         X_test, Y_test = create_dataset(test_data, time_step)
 
         # Veriyi LSTM modeline uygun şekle dönüştürme
-        X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-        X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+        X_train = X_train.reshape(X_train.shape[0], -1)  # Flatten the time steps into features
+        Y_train = Y_train.reshape(Y_train.shape[0], 1)  # Ensure Y_train is a 2D array
 
         # Model dosya adını belirle
         model_filename = get_model_filename(time_step)
 
         # Modelin var olup olmadığını kontrol et
         if os.path.exists(model_filename):
-            # Mevcut model yükleniyor
-            best_model = load_model(model_filename)
+            # Mevcut modeli yükle
+            bst = xgb.Booster()  # Modeli yüklemek için Booster nesnesi oluşturuyoruz
+            bst.load_model(model_filename)
             st.write(f"Zaman adımına uygun mevcut model ({model_filename}) yüklendi.")
 
-            # `X_test` ve `Y_test` daha önce eğitimde kullanıldı ve mevcut
-            predictions = best_model.predict(X_test)
-            predictions = scaler.inverse_transform(predictions.reshape(-1, 1))
-            Y_test_original = scaler.inverse_transform(
-                Y_test.reshape(-1, 1))  # Y_test_original her durumda tanımlanmalı
-        else:
+            # Tahmin için veriyi hazırlama
+            dtest = xgb.DMatrix(X_test, label=Y_test)
 
-            # Model yok, eğitimi başlat
+            # Tahmin yapma
+            predictions = bst.predict(dtest)
+            predictions = scaler.inverse_transform(predictions.reshape(-1, 1))
+            Y_test_original = scaler.inverse_transform(Y_test.reshape(-1, 1))
+
+        else:
+            # Model yoksa, yeni bir model eğit
             st.write(f"Zaman adımı ({time_step}) için uygun model bulunamadı. Yeni model eğitiliyor...")
 
             # Zaman adımını belirleme
@@ -202,58 +175,75 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
             X_train, Y_train = create_dataset(train_data, time_step)
             X_test, Y_test = create_dataset(test_data, time_step)
 
-            # Veriyi LSTM modeline uygun şekle dönüştürme
-            X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-            X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+            # Veriyi XGBoost için uygun hale getirme
+            X_train = X_train.reshape(X_train.shape[0], -1)  # Zaman adımlarını özelliklere dönüştürme
+            Y_train = Y_train.reshape(Y_train.shape[0], 1)  # Y_train'in 2D bir dizi olmasını sağlama
 
-            # GridSearchCV için KerasRegressor kullanımı
-            model = KerasRegressor(build_fn=create_model, verbose=1)
-
-            # Hiperparametre grid tanımı
-            param_grid = {
-                #'units': [100, 200],
-                'batch_size': [32],
-                'epochs': [30],
-                #'dropout_rate' : [0.2, 0.3],
+            # XGBoost model parametrelerini ayarlama
+            params = {
+                'objective': 'reg:squarederror',
+                'learning_rate': 0.1,
+                'max_depth': 5,
+                'eval_metric': 'rmse'
             }
 
-            # GridSearchCV uygulaması
-            grid = GridSearchCV(estimator=model, param_grid=param_grid, cv=3, n_jobs=-1, verbose=2)
-            grid_result = grid.fit(X_train, Y_train)
+            # Parametre grid'i
+            param_grid = {
+                'n_estimators': [100, 200],
+                'learning_rate': [0.01, 0.1, 0.2, 0.001],
+                'max_depth': [3, 5, 7]
+            }
 
-            # En iyi parametreler
-            best_params = grid_result.best_params_
+            # GridSearchCV kullanarak en iyi parametreyi bulma
+            grid_search = GridSearchCV(estimator=xgb.XGBRegressor(), param_grid=param_grid, cv=3,
+                                       scoring='neg_mean_squared_error', n_jobs=-1, verbose=2)
+            grid_search.fit(X_train, Y_train)
+
+            # En iyi parametreleri al
+            best_params = grid_search.best_params_
             st.write("En İyi Parametreler:", best_params)
 
-            # En iyi model ile tahmin yapma
-            best_model = grid_result.best_estimator_
+            best_model = grid_search.best_estimator_
 
-            # EarlyStopping ve ModelCheckpoint kullanımı
-            early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+            # Veriyi DMatrix formatına dönüştürme
+            dtrain = xgb.DMatrix(X_train, label=Y_train)
+            dtest = xgb.DMatrix(X_test, label=Y_test)
+
+            # Eval seti oluşturma
+            eval_set = [(dtrain, 'train'), (dtest, 'test')]
+
+            # Modeli eğitme
+            evals_result = {}
+            bst = xgb.train(params=params, dtrain=dtrain, num_boost_round=1000, evals=eval_set,
+                            evals_result=evals_result, verbose_eval=True)
+
+            # Modeli kaydetme
             model_filename = get_model_filename(time_step)
-            checkpoint = ModelCheckpoint(model_filename, monitor='val_loss', save_best_only=True, mode='min')
+            bst.save_model(model_filename)
+            st.write(f"Yeni model kaydedildi: {model_filename}")
 
-            predictions = best_model.predict(X_test)
+            # Test seti üzerinde tahmin yapma
+            predictions = bst.predict(dtest)
             predictions = scaler.inverse_transform(predictions.reshape(-1, 1))
-            Y_test_original = scaler.inverse_transform(
-                Y_test.reshape(-1, 1))  # Y_test_original her durumda tanımlanmalı
-            history = best_model.fit(X_train, Y_train, epochs=best_params['epochs'],
-                                     batch_size=best_params['batch_size'], validation_data=(X_test, Y_test),
-                                     callbacks=[early_stop, checkpoint])
+            Y_test_original = scaler.inverse_transform(Y_test.reshape(-1, 1))
 
             # Eğitim ve test kaybını görselleştirme
-            if hasattr(history, 'history'):
+            if evals_result:
                 st.subheader("Eğitim ve Test Kaybı")
                 plt.figure(figsize=(10, 6))
-                plt.plot(history.history['loss'], label='Eğitim Kaybı', marker='o', markersize=3)
-                plt.plot(history.history['val_loss'], label='Test Kaybı', marker='o', markersize=3)
+
+                plt.plot(evals_result['train']['rmse'], label='Eğitim Kaybı', marker='o', markersize=3)
+                plt.plot(evals_result['test']['rmse'], label='Test Kaybı', marker='o', markersize=3)
+
                 plt.xlabel('Epoch')
-                plt.ylabel('Kayıp Değeri')
-                plt.title('Model Kaybı')
+                plt.ylabel('RMSE (Root Mean Squared Error)')
+                plt.title('XGBoost Model Kaybı')
                 plt.xticks(rotation=45)
                 plt.grid(True)
                 plt.legend()
                 plt.tight_layout()
+
+                # Streamlit ile görselleştirme
                 st.pyplot(plt)
 
         # Gerçek ve tahmin edilen fiyatları görselleştirme
@@ -270,27 +260,19 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
         plt.tight_layout()
         st.pyplot(plt)
 
-        # Gelecek günler için tahmin yapma
-        last_60_days = scaled_data[-time_step:].reshape(1, time_step, 1)
+        # Gelecek tahminleri için giriş verilerini hazırlama
+        future_input = scaled_data[-time_step:].reshape(1, -1)
+        future_input = future_input.flatten()
+
         future_predictions = []
-
         for _ in range(num_days):
-            next_pred = best_model.predict(last_60_days)
+            input_data = future_input[-time_step:]  # Son zaman adımına göre veri al
+            input_data = input_data.reshape(1, -1)  # 2D diziye dönüştür
+            pred = bst.predict(xgb.DMatrix(input_data))  # Modeli kullanarak tahmin yap
+            future_predictions.append(pred[0])
+            future_input = np.append(future_input, pred)
 
-            # next_pred'in boyutunu kontrol et ve uygun şekilde şekillendir
-            if next_pred.ndim == 2:  # Eğer 2D ise, 3D'ye dönüştür
-                next_pred = next_pred.reshape(1, 1, 1)
-            elif next_pred.ndim == 1:  # Eğer 1D ise, 3D'ye dönüştür
-                next_pred = next_pred.reshape(1, 1, 1)
-            elif next_pred.ndim == 0:  # Eğer 0D ise, tek bir değeri doğrudan al
-                next_pred = np.array([next_pred]).reshape(1, 1, 1)
-
-            # Tek bir değeri alıyoruz
-            future_predictions.append(next_pred[0, 0, 0])  # 3D diziden ilk değeri alıyoruz
-
-            # Sonraki tahminleri hazırlamak için last_60_days'ı güncelle
-            last_60_days = np.append(last_60_days[:, 1:, :], next_pred, axis=1)
-
+        # Tahminleri orijinal ölçekte geri dönüştür
         future_predictions = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
 
         # Gelecek günler için tarihleri oluşturma
