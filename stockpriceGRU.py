@@ -2,12 +2,12 @@ import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from keras.optimizers import Adam
+from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
 from sklearn.model_selection import GridSearchCV
 from tensorflow.keras import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, LayerNormalization
+from tensorflow.keras.layers import GRU, Dense, Dropout, LayerNormalization
 from tensorflow.keras.wrappers.scikit_learn import KerasRegressor
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from scipy.stats import zscore
@@ -18,11 +18,11 @@ import os
 
 # Zaman adımına uygun model dosya adını oluştur
 def get_model_filename(time_step):
-    return f'model_time_step_{time_step}.h5'
+    return f'grumodel_time_step_{time_step}.h5'
 
 # Streamlit başlık ve ayarlar
 st.title("Hisse Senedi Fiyat Tahmini")
-st.write("Bu uygulama, GridSearchCV kullanarak optimize edilen LSTM modeli ile hisse senedi fiyat tahmini yapar.")
+st.write("Bu uygulama, GridSearchCV kullanarak optimize edilen GRU modeli ile hisse senedi fiyat tahmini yapar.")
 
 # Kullanıcıdan hisse senedi sembolü ve tarih aralığı alalım
 ticker = st.text_input("Hisse Sembolü (Örn: AAPL)", "AAPL")
@@ -31,7 +31,6 @@ end_date = st.date_input("Bitiş Tarihi", pd.to_datetime(datetime.today()))
 
 # Kullanıcının tahmin etmek istediği gün sayısını seçmesine olanak tanıyalım
 num_days = st.slider("Gelecek gün sayısını seçin", min_value=1, max_value=60, value=30)
-
 
 # Zaman adımını belirleme
 def determine_time_step(data, min_time_step=2, average_time_step=5, max_time_step=20):
@@ -86,19 +85,19 @@ def remove_outliers(data, threshold=3):
     filtered_entries = (abs_z_scores < threshold).all(axis=1)  # Tüm sütunlarda eşik değerini kontrol eder
     return data[filtered_entries]
 
-# LSTM modelini oluşturma fonksiyonu
+# GRU modelini oluşturma fonksiyonu
 from tensorflow.keras.regularizers import l2
 
-def create_model( dropout_rate=0.02, l2_rate=0.001):
+def create_model(units=256, dropout_rate=0.02, l2_rate=0.001, learning_rate=0.0001):
     model = Sequential()
 
-    # İlk LSTM Katmanı
-    model.add(LSTM(300, return_sequences=True, kernel_regularizer=l2(l2_rate)))
+    # İlk GRU Katmanı
+    model.add(GRU(units=units, return_sequences=True, kernel_regularizer=l2(l2_rate)))
     model.add(LayerNormalization())
     model.add(Dropout(dropout_rate))
 
-    # İkinci LSTM Katmanı
-    model.add(LSTM(150, return_sequences=False, kernel_regularizer=l2(l2_rate)))
+    # İkinci GRU Katmanı
+    model.add(GRU(units=units, return_sequences=False, kernel_regularizer=l2(l2_rate)))
     model.add(LayerNormalization())
     model.add(Dropout(dropout_rate))
 
@@ -106,10 +105,9 @@ def create_model( dropout_rate=0.02, l2_rate=0.001):
     model.add(Dense(1, kernel_regularizer=l2(l2_rate)))
 
     # Modeli Derleme
-    optimizer = Adam(learning_rate=0.0001)
+    optimizer = Adam(learning_rate=learning_rate)
     model.compile(optimizer=optimizer, loss='mean_squared_error')
     return model
-
 
 # Veriyi çekme düğmesi
 if st.button("Veriyi Çek ve Modeli Eğit"):
@@ -145,10 +143,8 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
             st.info("Veride aykırı değer bulunamadı.")
 
         # Kapanış fiyatını normalize etme
-       # close_prices = stock_data['Close'].values.reshape(-1, 1)
         scaler = MinMaxScaler(feature_range=(0, 1))
         scaled_data = scaler.fit_transform(filtered_close_prices)
-
 
         # Eğitim ve test verilerini ayırma (%80 eğitim, %20 test)
         train_size = int(len(scaled_data) * 0.8)
@@ -165,7 +161,6 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
             if len(X) == 0:
                 st.warning("Insufficient data for the specified time_step. Try using a smaller time_step or more data.")
             return np.array(X), np.array(Y)
-
 
         # Zaman adımını belirleme
         time_step = determine_time_step(stock_data)
@@ -202,7 +197,7 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
             X_train, Y_train = create_dataset(train_data, time_step)
             X_test, Y_test = create_dataset(test_data, time_step)
 
-            # Veriyi LSTM modeline uygun şekle dönüştürme
+            # Veriyi GRU modeline uygun şekle dönüştürme
             X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
             X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
 
@@ -211,10 +206,8 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
 
             # Hiperparametre grid tanımı
             param_grid = {
-                #'units': [100, 200],
                 'batch_size': [32],
                 'epochs': [50],
-                #'dropout_rate' : [0.2, 0.3],
             }
 
             # GridSearchCV uygulaması
@@ -308,8 +301,7 @@ if st.button("Veriyi Çek ve Modeli Eğit"):
         plt.legend()
         plt.tight_layout()
         st.pyplot(plt)
-
-        # Hata metrikleri
+ # Hata metrikleri
         rmse = np.sqrt(mean_squared_error(Y_test_original, predictions))
         mse = mean_squared_error(Y_test_original, predictions)
         mae = mean_absolute_error(Y_test_original, predictions)
